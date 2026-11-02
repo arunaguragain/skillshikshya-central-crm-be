@@ -1,4 +1,5 @@
 import csv
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -6,7 +7,7 @@ from django.db.models import (
     Avg, Case, Count, DecimalField, FloatField, Q, Sum, Value, When,
 )
 from django.db.models.functions import Cast, Coalesce, Round, TruncDate
-from django.http import HttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.utils import timezone
 
 from rest_framework import viewsets, status
@@ -48,6 +49,20 @@ from apps.lead.filters import (
 from apps.global_config.pagination import CustomPagination
 from apps.global_config.permissions import IsStaffOrHasPermission
 from apps.global_config.filters import BranchFilterBackend
+
+
+def _safe_csv_text(value, is_phone=False):
+    text = '' if value is None else str(value)
+    if is_phone and re.fullmatch(r'\+?[0-9 ()-]+', text):
+        return text
+    if text.startswith(('=', '+', '-', '@', '\t', '\r')):
+        return f"'{text}"
+    return text
+
+
+class _CSVBuffer:
+    def write(self, value):
+        return value
 
 
 class ConfigViewSet(viewsets.ModelViewSet):
@@ -375,8 +390,51 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
             'by_user': by_user,
         })
 
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        qs = self.filter_queryset(self.get_queryset())
+        npt = ZoneInfo('Asia/Kathmandu')
+        today = timezone.localtime(timezone.now(), npt).date().isoformat()
+        headers = [
+            'Date & time (NPT)', 'Direction', 'Lead', 'Reference', 'Phone',
+            'Caller', 'Logged by', 'Duration (MM:SS)', 'Seconds', 'Outcome',
+            'Notes', 'Recording',
+        ]
+
+        def stream_csv():
+            yield b'\xef\xbb\xbf'
+            writer = csv.writer(_CSVBuffer())
+            yield writer.writerow(headers).encode('utf-8')
+            for call in qs.iterator(chunk_size=2000):
+                call_time = timezone.localtime(call.call_timestamp, npt)
+                lead = call.lead
+                yield writer.writerow([
+                    call_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    _safe_csv_text(call.direction),
+                    _safe_csv_text(lead.full_name if lead else ''),
+                    _safe_csv_text(lead.reference_number if lead else ''),
+                    _safe_csv_text(call.phone_number, is_phone=True),
+                    _safe_csv_text(call.caller),
+                    _safe_csv_text(
+                        (call.created_by.name or 'Unknown') if call.created_by else 'Unknown',
+                    ),
+                    format_duration(call.duration_seconds),
+                    call.duration_seconds,
+                    _safe_csv_text(call.outcome),
+                    _safe_csv_text(call.notes),
+                    _safe_csv_text(call.recording_url),
+                ]).encode('utf-8')
+
+        response = StreamingHttpResponse(
+            stream_csv(), content_type='text/csv; charset=utf-8',
+        )
+        response['Content-Disposition'] = (
+            f'attachment; filename="calls-{today}.csv"'
+        )
+        return response
+
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'summary']:
+        if self.action in ['list', 'retrieve', 'summary', 'export']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
 

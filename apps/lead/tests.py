@@ -1,3 +1,7 @@
+import csv
+import io
+import re
+
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -146,6 +150,12 @@ class GlobalCallListTests(APITestCase):
             phone_number='9822222222', duration_seconds=60,
             created_by=self.admin, branch=self.branch,
         )
+
+    def _read_call_export(self, url='/api/calls/export/'):
+        response = self.client.get(url)
+        body = b''.join(response.streaming_content)
+        rows = list(csv.reader(io.StringIO(body.decode('utf-8-sig'))))
+        return response, body, rows
 
     def test_list_returns_all_calls_newest_first(self):
         response = self.client.get('/api/calls/')
@@ -332,6 +342,112 @@ class GlobalCallListTests(APITestCase):
         with self.assertNumQueries(3):
             thirty_call_response = self.client.get('/api/calls/summary/')
         self.assertEqual(thirty_call_response.data['total_calls'], 30)
+
+    def test_export_csv_headers_filename_and_bom(self):
+        response, body, rows = self._read_call_export()
+
+        self.assertEqual(response['Content-Type'], 'text/csv; charset=utf-8')
+        self.assertRegex(
+            response['Content-Disposition'],
+            r'^attachment; filename="calls-\d{4}-\d{2}-\d{2}\.csv"$',
+        )
+        self.assertTrue(body.startswith(b'\xef\xbb\xbf'))
+        self.assertEqual(rows[0], [
+            'Date & time (NPT)', 'Direction', 'Lead', 'Reference', 'Phone',
+            'Caller', 'Logged by', 'Duration (MM:SS)', 'Seconds', 'Outcome',
+            'Notes', 'Recording',
+        ])
+
+    def test_export_csv_matches_filtered_list_count(self):
+        list_response = self.client.get('/api/calls/?direction=inbound')
+        export_response, _, rows = self._read_call_export(
+            '/api/calls/export/?direction=inbound',
+        )
+
+        self.assertEqual(export_response.status_code, 200)
+        self.assertEqual(len(rows) - 1, list_response.data['count'])
+        self.assertEqual([row[1] for row in rows[1:]], ['inbound'])
+
+    def test_export_csv_protects_formula_notes(self):
+        self.recent_call.notes = '=HYPERLINK("https://example.invalid")'
+        self.recent_call.save(update_fields=['notes'])
+
+        _, _, rows = self._read_call_export()
+        exported_call = next(row for row in rows[1:] if row[5] == 'Counselor Nine')
+
+        self.assertEqual(
+            exported_call[10], "'=HYPERLINK(\"https://example.invalid\")",
+        )
+
+    def test_export_csv_only_exempts_valid_phone_values(self):
+        self.recent_call.phone_number = '+9779800000000'
+        self.recent_call.save(update_fields=['phone_number'])
+
+        _, _, rows = self._read_call_export()
+        exported_call = next(row for row in rows[1:] if row[5] == 'Counselor Nine')
+        self.assertEqual(exported_call[4], '+9779800000000')
+
+        self.recent_call.phone_number = "=cmd|' /C calc'!A0"
+        self.recent_call.save(update_fields=['phone_number'])
+
+        _, _, rows = self._read_call_export()
+        exported_call = next(row for row in rows[1:] if row[5] == 'Counselor Nine')
+        self.assertEqual(exported_call[4], "'=cmd|' /C calc'!A0")
+
+    def test_export_csv_preserves_devanagari_text(self):
+        self.lead.full_name = 'विद्यार्थी'
+        self.lead.save(update_fields=['full_name'])
+        self.recent_call.caller = 'राम'
+        self.recent_call.save(update_fields=['caller'])
+
+        _, _, rows = self._read_call_export()
+        exported_call = next(row for row in rows[1:] if row[5] == 'राम')
+
+        self.assertEqual(exported_call[2], 'विद्यार्थी')
+
+    def test_export_csv_handles_null_related_and_text_fields(self):
+        self.lead.full_name = ''
+        self.lead.save(update_fields=['full_name'])
+        self.recent_call.created_by = None
+        self.recent_call.outcome = None
+        self.recent_call.notes = None
+        self.recent_call.recording_url = None
+        self.recent_call.save(update_fields=[
+            'created_by', 'outcome', 'notes', 'recording_url',
+        ])
+
+        _, _, rows = self._read_call_export()
+        exported_call = next(row for row in rows[1:] if row[5] == 'Counselor Nine')
+
+        self.assertEqual(exported_call[2], '')
+        self.assertEqual(exported_call[6], 'Unknown')
+        self.assertEqual(exported_call[9:12], ['', '', ''])
+
+    def test_export_csv_query_count_is_fixed(self):
+        from django.utils import timezone as tz
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+            caller='Third Caller', phone_number='test-phone-3',
+            duration_seconds=15, created_by=self.counselor, branch=self.branch,
+        )
+        with self.assertNumQueries(1):
+            three_call_response = self._read_call_export()
+        self.assertEqual(len(three_call_response[2]) - 1, 3)
+
+        LeadCall.objects.bulk_create([
+            LeadCall(
+                lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+                caller=f'Bulk Caller {index}', phone_number=f'test-phone-{index}',
+                duration_seconds=index, created_by=self.counselor,
+                branch=self.branch,
+            )
+            for index in range(27)
+        ])
+        with self.assertNumQueries(1):
+            thirty_call_response = self._read_call_export()
+        self.assertEqual(len(thirty_call_response[2]) - 1, 30)
 
     def test_branch_scoping_for_non_staff(self):
         from apps.branch.models import Branch
