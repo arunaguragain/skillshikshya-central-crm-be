@@ -1,6 +1,11 @@
 import csv
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
+from django.db.models import (
+    Avg, Case, Count, DecimalField, FloatField, Q, Sum, Value, When,
+)
+from django.db.models.functions import Cast, Coalesce, Round, TruncDate
 from django.http import HttpResponse
 from django.utils import timezone
 
@@ -12,6 +17,7 @@ from rest_framework.response import Response
 
 from django_filters.rest_framework import DjangoFilterBackend
 
+from apps.callminutes.utils import format_duration
 from apps.lead.models import (
     LearningMode, Institution, Province, City, LeadSource, Campaign, LeadStatus, LeadPriority,
     LeadTag, LeadType, Lead, LeadCourseInterest, Enrollment, Payment,
@@ -297,8 +303,80 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
             'lead', 'created_by', 'branch',
         )
 
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        qs = self.filter_queryset(self.get_queryset())
+        totals = qs.aggregate(
+            total_calls=Count('id'),
+            inbound=Count('id', filter=Q(direction='inbound')),
+            outbound=Count('id', filter=Q(direction='outbound')),
+            total_seconds=Coalesce(Sum('duration_seconds'), Value(0)),
+            avg_seconds=Coalesce(Avg('duration_seconds'), Value(0.0)),
+            connected_calls=Count('id', filter=Q(duration_seconds__gt=0)),
+            connect_rate=Coalesce(
+                Cast(
+                    Round(
+                        Avg(Case(
+                            When(duration_seconds__gt=0, then=Value(1)),
+                            default=Value(0),
+                            output_field=DecimalField(max_digits=10, decimal_places=3),
+                        )),
+                        precision=3,
+                    ),
+                    FloatField(),
+                ),
+                Value(0.0),
+            ),
+        )
+
+        by_day = [
+            {
+                'date': row['date'],
+                'calls': row['calls'],
+                'seconds': row['seconds'],
+            }
+            for row in qs.annotate(
+                date=TruncDate(
+                    'call_timestamp', tzinfo=ZoneInfo('Asia/Kathmandu'),
+                ),
+            ).values('date').annotate(
+                calls=Count('id'),
+                seconds=Coalesce(Sum('duration_seconds'), Value(0)),
+            ).order_by('date')
+        ]
+        by_user = [
+            {
+                'user_id': row['created_by_id'],
+                'name': row['created_by__name'] or 'Unknown',
+                'calls': row['calls'],
+                'seconds': row['seconds'],
+            }
+            for row in qs.values(
+                'created_by_id', 'created_by__name',
+            ).annotate(
+                calls=Count('id'),
+                seconds=Coalesce(Sum('duration_seconds'), Value(0)),
+            ).order_by('-calls', 'created_by_id')[:10]
+        ]
+
+        total_calls = totals['total_calls']
+        total_seconds = totals['total_seconds']
+        avg_seconds = round(totals['avg_seconds'])
+        return Response({
+            'total_calls': total_calls,
+            'inbound': totals['inbound'],
+            'outbound': totals['outbound'],
+            'total_seconds': total_seconds,
+            'total_formatted': format_duration(total_seconds),
+            'avg_seconds': avg_seconds,
+            'connected_calls': totals['connected_calls'],
+            'connect_rate': totals['connect_rate'],
+            'by_day': by_day,
+            'by_user': by_user,
+        })
+
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action in ['list', 'retrieve', 'summary']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
 

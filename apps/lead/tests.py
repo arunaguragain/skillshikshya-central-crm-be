@@ -184,6 +184,155 @@ class GlobalCallListTests(APITestCase):
         search_lead = self.client.get('/api/calls/?search=Call Person')
         self.assertEqual(search_lead.data['count'], 2)
 
+    def test_summary_totals_average_and_connect_rate(self):
+        from django.utils import timezone as tz
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+            caller='Zero Caller', phone_number='9800000000',
+            duration_seconds=0, branch=self.branch,
+        )
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+            caller='One Second Caller', phone_number='9800000003',
+            duration_seconds=1, branch=self.branch,
+        )
+        response = self.client.get('/api/calls/summary/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['total_calls'], 4)
+        self.assertEqual(response.data['inbound'], 1)
+        self.assertEqual(response.data['outbound'], 3)
+        self.assertEqual(response.data['total_seconds'], 331)
+        self.assertEqual(response.data['total_formatted'], '05:31')
+        self.assertEqual(response.data['avg_seconds'], 83)
+        self.assertIsInstance(response.data['avg_seconds'], int)
+        self.assertEqual(response.data['connected_calls'], 3)
+        self.assertEqual(response.data['connect_rate'], 0.75)
+
+    def test_summary_by_user_top_ten_and_unknown_creator(self):
+        from django.utils import timezone as tz
+        from apps.lead.models import LeadCall
+
+        now = tz.now()
+        for index in range(9):
+            user = User.objects.create_user(
+                email=f'caller{index}@test.com', name=f'Caller {index}',
+                password='pass',
+            )
+            LeadCall.objects.create(
+                lead=self.lead, call_timestamp=now, direction='outbound',
+                caller=f'Caller {index}', phone_number=f'980001{index:04d}',
+                duration_seconds=10, created_by=user, branch=self.branch,
+            )
+
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=now, direction='outbound',
+            caller='Counselor Nine', phone_number='9800020001',
+            duration_seconds=10, created_by=self.counselor, branch=self.branch,
+        )
+        for index in range(2):
+            LeadCall.objects.create(
+                lead=self.lead, call_timestamp=now, direction='outbound',
+                caller='Unknown Caller', phone_number=f'980003{index:04d}',
+                duration_seconds=10, created_by=None, branch=self.branch,
+            )
+
+        response = self.client.get('/api/calls/summary/')
+        by_user = response.data['by_user']
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(by_user), 10)
+        call_counts = [row['calls'] for row in by_user]
+        self.assertEqual(call_counts, sorted(call_counts, reverse=True))
+
+        unknown = next(row for row in by_user if row['user_id'] is None)
+        self.assertEqual(unknown['name'], 'Unknown')
+        self.assertEqual(unknown['calls'], 2)
+
+        counselor_index = next(
+            index for index, row in enumerate(by_user)
+            if row['user_id'] == self.counselor.id
+        )
+        admin_index = next(
+            index for index, row in enumerate(by_user)
+            if row['user_id'] == self.admin.id
+        )
+        self.assertEqual(by_user[counselor_index]['calls'], 2)
+        self.assertEqual(by_user[admin_index]['calls'], 1)
+        self.assertLess(counselor_index, admin_index)
+
+    def test_summary_uses_kathmandu_date(self):
+        from datetime import datetime, timezone
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead,
+            call_timestamp=datetime(2026, 10, 28, 20, 0, tzinfo=timezone.utc),
+            direction='outbound', caller='Late Caller',
+            phone_number='9800000001', duration_seconds=30,
+            created_by=self.counselor, branch=self.branch,
+        )
+        response = self.client.get('/api/calls/summary/')
+
+        day = next(
+            row for row in response.data['by_day']
+            if row['date'].isoformat() == '2026-10-29'
+        )
+        self.assertEqual(day['calls'], 1)
+        self.assertEqual(day['seconds'], 30)
+
+    def test_summary_empty_result_returns_zeros(self):
+        response = self.client.get('/api/calls/summary/?caller=NoMatchingCaller')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['total_calls'], 0)
+        self.assertEqual(response.data['inbound'], 0)
+        self.assertEqual(response.data['outbound'], 0)
+        self.assertEqual(response.data['total_seconds'], 0)
+        self.assertEqual(response.data['total_formatted'], '00:00')
+        self.assertEqual(response.data['avg_seconds'], 0)
+        self.assertEqual(response.data['connected_calls'], 0)
+        self.assertEqual(response.data['connect_rate'], 0)
+        self.assertEqual(response.data['by_day'], [])
+        self.assertEqual(response.data['by_user'], [])
+
+    def test_summary_respects_direction_filter(self):
+        response = self.client.get('/api/calls/summary/?direction=inbound')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['total_calls'], 1)
+        self.assertEqual(response.data['inbound'], 1)
+        self.assertEqual(response.data['outbound'], 0)
+        self.assertEqual(response.data['total_seconds'], 60)
+
+    def test_summary_query_count_is_fixed(self):
+        from django.utils import timezone as tz
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+            caller='Third Caller', phone_number='9800000002',
+            duration_seconds=15, created_by=self.counselor, branch=self.branch,
+        )
+        with self.assertNumQueries(3):
+            three_call_response = self.client.get('/api/calls/summary/')
+        self.assertEqual(three_call_response.data['total_calls'], 3)
+
+        LeadCall.objects.bulk_create([
+            LeadCall(
+                lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+                caller=f'Bulk Caller {index}', phone_number=f'980000{index:04d}',
+                duration_seconds=index, created_by=self.counselor,
+                branch=self.branch,
+            )
+            for index in range(27)
+        ])
+        with self.assertNumQueries(3):
+            thirty_call_response = self.client.get('/api/calls/summary/')
+        self.assertEqual(thirty_call_response.data['total_calls'], 30)
+
     def test_branch_scoping_for_non_staff(self):
         from apps.branch.models import Branch
         from apps.lead.models import LeadCall
