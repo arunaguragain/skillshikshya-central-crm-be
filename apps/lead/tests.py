@@ -166,6 +166,48 @@ class GlobalCallListTests(APITestCase):
         self.assertEqual(row['lead_name'], 'Call Person')
         self.assertTrue(row['lead_reference_number'].startswith('LD-'))
 
+    def test_list_includes_formatted_duration(self):
+        response = self.client.get('/api/calls/')
+
+        self.assertEqual(response.status_code, 200)
+        row = next(
+            result for result in response.data['results']
+            if result['id'] == self.old_call.id
+        )
+        self.assertEqual(row['duration_formatted'], '01:00')
+
+    def test_list_query_count_is_fixed_for_three_and_thirty_calls(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from django.utils import timezone as tz
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+            caller='Third Caller', phone_number='test-phone-3',
+            duration_seconds=15, created_by=self.counselor, branch=self.branch,
+        )
+        with CaptureQueriesContext(connection) as three_call_queries:
+            three_call_response = self.client.get('/api/calls/?page_size=100')
+            self.assertEqual(len(three_call_response.data['results']), 3)
+
+        LeadCall.objects.bulk_create([
+            LeadCall(
+                lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+                caller=f'Bulk Caller {index}', phone_number=f'test-phone-{index}',
+                duration_seconds=index, created_by=self.counselor,
+                branch=self.branch,
+            )
+            for index in range(27)
+        ])
+        with CaptureQueriesContext(connection) as thirty_call_queries:
+            thirty_call_response = self.client.get('/api/calls/?page_size=100')
+            self.assertEqual(len(thirty_call_response.data['results']), 30)
+
+        self.assertEqual(
+            len(three_call_queries), len(thirty_call_queries),
+        )
+
     def test_filter_direction(self):
         response = self.client.get('/api/calls/?direction=inbound')
         self.assertEqual([r['id'] for r in response.data['results']], [self.old_call.id])
@@ -461,3 +503,163 @@ class GlobalCallListTests(APITestCase):
         self.client.force_authenticate(other_admin)
         response = self.client.get('/api/calls/')
         self.assertNotIn(self.recent_call.id, [r['id'] for r in response.data['results']])
+
+
+class CallBranchScopingTests(APITestCase):
+    def setUp(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from apps.branch.models import Branch
+        from apps.lead.models import LeadCall
+
+        self.branch_x = Branch.objects.create(name='Branch X', code='BRX')
+        self.branch_y = Branch.objects.create(name='Branch Y', code='BRY')
+        self.user_x = User.objects.create_user(
+            email='branch-x@test.com', name='Branch X User', password='pass',
+            branch=self.branch_x,
+        )
+        self.user_y = User.objects.create_user(
+            email='branch-y@test.com', name='Branch Y User', password='pass',
+            branch=self.branch_y,
+        )
+        self.staff = User.objects.create_user(
+            email='branch-staff@test.com', name='Branch Staff', password='pass',
+            is_staff=True,
+        )
+        lead_x = Lead.objects.create(full_name='Branch X Lead', phone='fixture-x')
+        lead_y = Lead.objects.create(full_name='Branch Y Lead', phone='fixture-y')
+        now = timezone.now()
+        self.calls_x = [
+            LeadCall.objects.create(
+                lead=lead_x, call_timestamp=now,
+                direction='outbound', caller='X Caller One',
+                phone_number='fixture-x1', duration_seconds=120,
+                created_by=self.user_x, branch=self.branch_x,
+            ),
+            LeadCall.objects.create(
+                lead=lead_x, call_timestamp=now + timedelta(seconds=1),
+                direction='inbound', caller='X Caller Two',
+                phone_number='fixture-x2', duration_seconds=60,
+                created_by=self.user_x, branch=self.branch_x,
+            ),
+        ]
+        self.calls_y = [
+            LeadCall.objects.create(
+                lead=lead_y, call_timestamp=now + timedelta(seconds=2),
+                direction='outbound', caller='Y Caller One',
+                phone_number='fixture-y1', duration_seconds=30,
+                created_by=self.user_y, branch=self.branch_y,
+            ),
+            LeadCall.objects.create(
+                lead=lead_y, call_timestamp=now + timedelta(seconds=3),
+                direction='inbound', caller='Y Caller Two',
+                phone_number='fixture-y2', duration_seconds=20,
+                created_by=self.user_y, branch=self.branch_y,
+            ),
+        ]
+        self.client.force_authenticate(self.user_x)
+
+    def _call_ids(self, url):
+        response = self.client.get(url)
+        ids = {row['id'] for row in response.data['results']}
+        return response, ids
+
+    def _export_rows(self, url):
+        response = self.client.get(url)
+        body = b''.join(response.streaming_content).decode('utf-8-sig')
+        rows = list(csv.reader(io.StringIO(body)))
+        return response, rows
+
+    def test_non_staff_x_list_contains_only_x_calls(self):
+        response, call_ids = self._call_ids('/api/calls/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(call_ids, {call.id for call in self.calls_x})
+
+    def test_non_staff_x_summary_contains_only_x_calls(self):
+        response = self.client.get('/api/calls/summary/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['total_calls'], 2)
+        self.assertEqual(response.data['total_seconds'], 180)
+        self.assertEqual(response.data['by_user'], [{
+            'user_id': self.user_x.id,
+            'name': 'Branch X User',
+            'calls': 2,
+            'seconds': 180,
+        }])
+
+    def test_non_staff_x_export_contains_only_x_rows(self):
+        response, rows = self._export_rows('/api/calls/export/')
+        exported_rows = rows[1:]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({row[5] for row in exported_rows}, {
+            'X Caller One', 'X Caller Two',
+        })
+        self.assertTrue(all(row[4].startswith('fixture-x') for row in exported_rows))
+        self.assertNotIn('Y Caller One', str(rows))
+        self.assertNotIn('Y Caller Two', str(rows))
+        self.assertNotIn('fixture-y1', str(rows))
+        self.assertNotIn('fixture-y2', str(rows))
+
+    def test_non_staff_cannot_override_branch_in_list_summary_or_export(self):
+        list_response, call_ids = self._call_ids(
+            f'/api/calls/?branch_id={self.branch_y.id}',
+        )
+        summary_response = self.client.get(
+            f'/api/calls/summary/?branch_id={self.branch_y.id}',
+        )
+        export_response, rows = self._export_rows(
+            f'/api/calls/export/?branch_id={self.branch_y.id}',
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(call_ids, {call.id for call in self.calls_x})
+        self.assertEqual(summary_response.status_code, 200)
+        self.assertEqual(summary_response.data['total_calls'], 2)
+        self.assertEqual(summary_response.data['by_user'][0]['user_id'], self.user_x.id)
+        self.assertEqual(export_response.status_code, 200)
+        self.assertEqual({row[5] for row in rows[1:]}, {
+            'X Caller One', 'X Caller Two',
+        })
+
+    def test_staff_sees_both_branches_by_default(self):
+        self.client.force_authenticate(self.staff)
+        expected_ids = {call.id for call in self.calls_x + self.calls_y}
+
+        list_response, call_ids = self._call_ids('/api/calls/')
+        summary_response = self.client.get('/api/calls/summary/')
+        export_response, rows = self._export_rows('/api/calls/export/')
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(call_ids, expected_ids)
+        self.assertEqual(summary_response.status_code, 200)
+        self.assertEqual(summary_response.data['total_calls'], 4)
+        self.assertEqual(
+            {row['user_id'] for row in summary_response.data['by_user']},
+            {self.user_x.id, self.user_y.id},
+        )
+        self.assertEqual(export_response.status_code, 200)
+        self.assertEqual({row[5] for row in rows[1:]}, {
+            'X Caller One', 'X Caller Two', 'Y Caller One', 'Y Caller Two',
+        })
+
+    def test_staff_branch_id_limits_list_summary_and_export(self):
+        self.client.force_authenticate(self.staff)
+        query = f'?branch_id={self.branch_y.id}'
+
+        list_response, call_ids = self._call_ids(f'/api/calls/{query}')
+        summary_response = self.client.get(f'/api/calls/summary/{query}')
+        export_response, rows = self._export_rows(f'/api/calls/export/{query}')
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(call_ids, {call.id for call in self.calls_y})
+        self.assertEqual(summary_response.status_code, 200)
+        self.assertEqual(summary_response.data['total_calls'], 2)
+        self.assertEqual(summary_response.data['total_seconds'], 50)
+        self.assertEqual(summary_response.data['by_user'][0]['user_id'], self.user_y.id)
+        self.assertEqual(export_response.status_code, 200)
+        self.assertEqual({row[5] for row in rows[1:]}, {
+            'Y Caller One', 'Y Caller Two',
+        })
