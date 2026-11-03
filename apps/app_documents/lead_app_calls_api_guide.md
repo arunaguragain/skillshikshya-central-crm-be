@@ -55,6 +55,62 @@ Read-only list of every call across all leads, **branch-scoped** (staff see all 
 
 The `lead` field is auto-set from the URL. `created_by` is auto-set to the requesting user.
 
+## Global Call Summary — `GET /api/calls/summary/`
+
+Returns an unpaginated summary of calls after applying the same filters, search, ordering, and branch scoping as the global call log.
+
+**Query params:** the same call filters as [`GET /api/calls/`](#global-call-log--get-apicalls), including `direction`, `created_by`, `student`, `lead`, `call_timestamp__gte` / `call_timestamp__lte`, `search`, and `ordering`. `branch_id` narrows results for staff and superusers; it does not override a non-staff user's assigned branch.
+
+**Response:**
+```json
+{
+    "total_calls": 2,
+    "inbound": 1,
+    "outbound": 1,
+    "total_seconds": 180,
+    "total_formatted": "03:00",
+    "avg_seconds": 90,
+    "connected_calls": 2,
+    "connect_rate": 1.0,
+    "by_day": [
+        {"date": "2026-10-29", "calls": 2, "seconds": 180}
+    ],
+    "by_user": [
+        {"user_id": 9, "name": "Counselor", "calls": 2, "seconds": 180}
+    ]
+}
+```
+
+`by_day` dates use Nepal time. `by_user` contains up to 10 users, ordered by call count descending; calls without a creator use `user_id: null` and `name: "Unknown"`. `connect_rate` is the connected-call share rounded to three decimal places; a call is connected when `duration_seconds > 0`.
+
+Staff and superusers see calls from all branches by default and may provide `branch_id`. Non-staff users with an assigned branch only see that branch, even if they provide another `branch_id`. A non-staff user without an assigned branch currently receives the unscoped call queryset.
+
+## Global Call Export — `GET /api/calls/export/`
+
+Downloads a streamed UTF-8 CSV using the same call filters, search, ordering, and branch scoping as the global call log. The export is not paginated.
+
+**Query params:** the same call filters as [`GET /api/calls/`](#global-call-log--get-apicalls), including `direction`, `created_by`, `student`, `lead`, `call_timestamp__gte` / `call_timestamp__lte`, `search`, and `ordering`. Staff and superusers may use `branch_id` to select a branch.
+
+**Filename:** `calls-YYYY-MM-DD.csv`, with the date based on Asia/Kathmandu.
+
+**CSV columns, in order:**
+1. Date & time (NPT)
+2. Direction
+3. Lead
+4. Reference
+5. Phone
+6. Caller
+7. Logged by
+8. Duration (MM:SS)
+9. Seconds
+10. Outcome
+11. Notes
+12. Recording
+
+Date & time values use `YYYY-MM-DD HH:MM:SS` in Nepal time. The CSV begins with a UTF-8 BOM for spreadsheet compatibility.
+
+Staff and superusers see calls from all branches by default and may provide `branch_id`. Non-staff users with an assigned branch only see that branch, even if they provide another `branch_id`. A non-staff user without an assigned branch currently receives the unscoped call queryset.
+
 ## Call Minutes Deduction
 
 Creating a call **deducts minutes from the requesting user's balance**:
