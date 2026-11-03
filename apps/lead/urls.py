@@ -10,7 +10,6 @@ from apps.lead.views import (
     LeadCallViewSet, LeadActivityViewSet, FollowUpViewSet, LeadDocumentViewSet,
     NotificationViewSet,
     GlobalFollowUpViewSet, GlobalEnrollmentViewSet, GlobalPaymentViewSet,
-    GlobalCallViewSet,
 )
 
 router = DefaultRouter()
